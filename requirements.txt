@@ -1,0 +1,12 @@
+torch
+torchvision
+pytorch-lightning
+facenet-pytorch
+tqdm
+gradio
+opencv-python
+PyYAML
+Pillow
+numpy
+scikit-learn
+tensorboard
