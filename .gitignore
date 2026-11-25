@@ -62,9 +62,8 @@ ehthumbs.db
 Thumbs.db
 
 # Model files (uncomment if models are too large)
-# *.pt
-# *.pth
-# models/
+models/*.pt
+models/*.ckpt
 
 # Temporary files
 *.tmp

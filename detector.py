@@ -25,28 +25,59 @@ class DeepfakeDetector:
 
         # 1. Dual-Scale MTCNN (Exact same as diagnostic script)
         self.mtcnn_20 = MTCNN(
-            image_size=224, margin=20, keep_all=False, post_process=False,
-            select_largest=True, thresholds=[0.5, 0.6, 0.6], device=self.device
+            image_size=224,
+            margin=20,
+            keep_all=False,
+            post_process=False,
+            select_largest=True,
+            thresholds=[0.5, 0.6, 0.6],
+            device=self.device,
         )
         self.mtcnn_36 = MTCNN(
-            image_size=224, margin=36, keep_all=False, post_process=False,
-            select_largest=True, thresholds=[0.5, 0.6, 0.6], device=self.device
+            image_size=224,
+            margin=36,
+            keep_all=False,
+            post_process=False,
+            select_largest=True,
+            thresholds=[0.5, 0.6, 0.6],
+            device=self.device,
         )
 
         # 2. Load Ensemble Models (fine_tuned_v1.pt + fine_tuned.pt + best_model.pt)
         self.model_v1 = self._load_model("models/fine_tuned_v1.pt")
-        self.model_ft = self._load_model(model_path if os.path.exists(model_path) else "models/fine_tuned.pt")
+        self.model_ft = self._load_model(
+            model_path if os.path.exists(model_path) else "models/fine_tuned.pt"
+        )
         self.model_base = self._load_model("models/best_model.pt")
 
         # 3. Load Bi-GRU Temporal Video Model
         self.gru_model, self.gru_is_trained = self._load_gru_model(gru_model_path)
 
         # 4. Standard Normalization
-        self.transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                ),
+            ]
+        )
+
+    @staticmethod
+    def _clean_state_dict_key(key):
+        for prefix in ("model.model.", "module.", "model.", "net."):
+            if key.startswith(prefix):
+                return key[len(prefix) :]
+        return key
+
+    @staticmethod
+    def _safe_prob(prob):
+        if prob is None:
+            return 0.0
+        if isinstance(prob, (list, tuple, np.ndarray)):
+            return float(prob[0]) if len(prob) > 0 and prob[0] is not None else 0.0
+        return float(prob)
 
     def _load_model(self, path):
         if not os.path.exists(path):
@@ -61,10 +92,7 @@ class DeepfakeDetector:
                 raw = torch.load(path, map_location=self.device)
             if isinstance(raw, dict) and "state_dict" in raw:
                 raw = raw["state_dict"]
-            clean_sd = {
-                (k.replace("model.", "", 1) if k.startswith("model.") else k): v
-                for k, v in raw.items()
-            }
+            clean_sd = {self._clean_state_dict_key(k): v for k, v in raw.items()}
             m.load_state_dict(clean_sd, strict=False)
             m.to(self.device)
             m.eval()
@@ -82,14 +110,15 @@ class DeepfakeDetector:
         if gru_path and os.path.exists(gru_path):
             try:
                 try:
-                    payload = torch.load(gru_path, map_location=self.device, weights_only=False)
+                    payload = torch.load(
+                        gru_path, map_location=self.device, weights_only=False
+                    )
                 except TypeError:
                     payload = torch.load(gru_path, map_location=self.device)
                 if isinstance(payload, dict) and "state_dict" in payload:
                     payload = payload["state_dict"]
                 clean_sd = {
-                    (k.replace("model.", "", 1) if k.startswith("model.") else k): v
-                    for k, v in payload.items()
+                    self._clean_state_dict_key(k): v for k, v in payload.items()
                 }
                 gru_net.load_state_dict(clean_sd, strict=False)
                 is_trained = True
@@ -110,14 +139,23 @@ class DeepfakeDetector:
         arr = t.permute(1, 2, 0).cpu().numpy().clip(0, 255).astype("uint8")
         return Image.fromarray(arr)
 
-    def _prepare_face_crops(self, raw_img):
-        """Extracts Dual-Scale MTCNN face crops + mirror TTA (4 crops per frame)."""
-        f20 = self.mtcnn_20(raw_img)
-        f36 = self.mtcnn_36(raw_img)
+    def _prepare_face_crops(self, raw_img, min_face_prob=0.60):
+        """Extracts Dual-Scale MTCNN face crops + mirror TTA (4 crops per frame) with confidence filtering."""
+        f20, p20_prob = self.mtcnn_20(raw_img, return_prob=True)
+        f36, p36_prob = self.mtcnn_36(raw_img, return_prob=True)
 
-        face_detected = (f20 is not None) or (f36 is not None)
-        p20 = self._tensor_to_pil(f20) if f20 is not None else raw_img.resize((224, 224))
-        p36 = self._tensor_to_pil(f36) if f36 is not None else p20
+        valid_20 = (f20 is not None) and (self._safe_prob(p20_prob) >= min_face_prob)
+        valid_36 = (f36 is not None) and (self._safe_prob(p36_prob) >= min_face_prob)
+        face_detected = valid_20 or valid_36
+
+        if valid_20:
+            p20 = self._tensor_to_pil(f20)
+        elif valid_36:
+            p20 = self._tensor_to_pil(f36)
+        else:
+            p20 = raw_img.resize((224, 224))
+
+        p36 = self._tensor_to_pil(f36) if valid_36 else p20
 
         crops = [p20, ImageOps.mirror(p20), p36, ImageOps.mirror(p36)]
         batch = torch.stack([self.transform(c) for c in crops]).to(self.device)
@@ -141,30 +179,32 @@ class DeepfakeDetector:
                 # Default balanced ensemble
                 fake_conf = min(v1_centered, 0.45) if f_v1 < 0.60 else 0.44
         else:
-            fake_conf = f_ft if f_ft is not None else (f_v1 if f_v1 is not None else 0.5)
+            fake_conf = (
+                f_ft if f_ft is not None else (f_v1 if f_v1 is not None else 0.5)
+            )
 
         return float(min(max(fake_conf, 0.01), 0.99))
 
     def _predict_single_batch(self, batch):
         """
         Runs the 3-model ensemble on a single frame's 4-crop batch (4, 3, 224, 224)
-        and also returns the 1280-dim feature vector and logits for the Bi-GRU.
+        and returns PURE primary-backbone features & logits for the Bi-GRU.
         """
         with torch.no_grad():
             feat_vec = None
             frame_logit = None
 
-            # 1. Primary Model: fine_tuned_v1.pt
+            # 1. Primary Model: fine_tuned_v1.pt (EXACT feature space used to train video_gru.pt)
             if self.model_v1 is not None:
                 feats_v1, logits_v1 = extract_backbone_features(self.model_v1, batch)
                 probs_v1 = torch.softmax(logits_v1, dim=1)
                 f_v1 = torch.mean(probs_v1[:, 0]).item()
-                feat_vec = torch.mean(feats_v1, dim=0)       # (1280,)
-                frame_logit = torch.mean(logits_v1, dim=0)   # (2,)
+                feat_vec = torch.mean(feats_v1, dim=0)  # Pure v1 (1280,)
+                frame_logit = torch.mean(logits_v1, dim=0)  # Pure v1 (2,)
             else:
                 f_v1 = None
 
-            # 2. Secondary Model: fine_tuned.pt
+            # 2. Secondary Model: fine_tuned.pt (spatial ensemble only; do NOT mix into v1 GRU features)
             if self.model_ft is not None:
                 feats_ft, logits_ft = extract_backbone_features(self.model_ft, batch)
                 probs_ft = torch.softmax(logits_ft, dim=1)
@@ -172,9 +212,6 @@ class DeepfakeDetector:
                 if feat_vec is None:
                     feat_vec = torch.mean(feats_ft, dim=0)
                     frame_logit = torch.mean(logits_ft, dim=0)
-                else:
-                    feat_vec = 0.6 * feat_vec + 0.4 * torch.mean(feats_ft, dim=0)
-                    frame_logit = 0.6 * frame_logit + 0.4 * torch.mean(logits_ft, dim=0)
             else:
                 f_ft = f_v1
 
@@ -208,16 +245,15 @@ class DeepfakeDetector:
             target_set = set(indices.tolist())
             max_idx = max(target_set)
 
-            curr_idx = 0
             grabbed_map = {}
-            while curr_idx <= max_idx:
-                ret, frame = cap.read()
-                if not ret:
+            for curr_idx in range(max_idx + 1):
+                if not cap.grab():
                     break
-                if curr_idx in target_set and frame is not None:
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    grabbed_map[curr_idx] = Image.fromarray(rgb)
-                curr_idx += 1
+                if curr_idx in target_set:
+                    ret, frame = cap.retrieve()
+                    if ret and frame is not None:
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        grabbed_map[curr_idx] = Image.fromarray(rgb)
 
             for idx in indices:
                 if idx in grabbed_map:
@@ -253,66 +289,92 @@ class DeepfakeDetector:
     def predict_video(self, video_path, num_frames=None):
         """
         Full Video Deepfake Detection using:
-        1. Dual-Scale MTCNN Face Cropping across T frames
-        2. 3-Model Spatial Ensemble per frame
-        3. Bi-GRU + Temporal Attention + Inter-Frame Flicker Analysis
+        1. Strict high-confidence face-only filtering (ignores logos, outros, and meme templates)
+        2. Pure v1 embeddings for Bi-GRU (eliminates feature-space mismatch)
+        3. Robust Median + Spatial-dominant fusion to prevent false positives on real videos
         """
         num_frames = num_frames or self.num_video_frames
         pil_frames = self._extract_video_frames(video_path, num_frames=num_frames)
 
-        frame_fake_scores = []
-        feature_list = []
-        logit_list = []
-        faces_found = 0
+        face_scores, face_feats, face_logits = [], [], []
+        fallback_scores, fallback_feats, fallback_logits = [], [], []
 
         for frame_img in pil_frames:
-            batch, has_face = self._prepare_face_crops(frame_img)
-            if has_face:
-                faces_found += 1
+            batch, has_face = self._prepare_face_crops(frame_img, min_face_prob=0.85)
             fake_score, feat_vec, frame_logit = self._predict_single_batch(batch)
-            frame_fake_scores.append(fake_score)
+
+            fallback_scores.append(fake_score)
             if feat_vec is not None:
-                feature_list.append(feat_vec)
-                logit_list.append(frame_logit)
+                fallback_feats.append(feat_vec)
+                fallback_logits.append(frame_logit)
+
+            if has_face:
+                face_scores.append(fake_score)
+                if feat_vec is not None:
+                    face_feats.append(feat_vec)
+                    face_logits.append(frame_logit)
+
+        faces_found = len(face_scores)
+
+        # Use strictly valid face frames whenever available
+        if faces_found >= 2:
+            frame_fake_scores = face_scores
+            feature_list = face_feats
+            logit_list = face_logits
+        else:
+            frame_fake_scores = fallback_scores
+            feature_list = fallback_feats
+            logit_list = fallback_logits
 
         scores_np = np.array(frame_fake_scores, dtype=np.float32)
 
-        # Top-K suspicious frames + mean spatial score
-        k = max(1, len(scores_np) // 3)
-        top_k_mean = float(np.mean(np.sort(scores_np)[-k:]))
+        # Median + Mean resists 1-2 glitch/blur/compression frames
+        median_spatial = float(np.median(scores_np))
         mean_spatial = float(np.mean(scores_np))
-        spatial_video_score = 0.55 * mean_spatial + 0.45 * top_k_mean
+        spatial_video_score = 0.60 * median_spatial + 0.40 * mean_spatial
 
-        # Bi-GRU Temporal Sequence Modeling
         gru_fake_prob = spatial_video_score
         temporal_flicker_score = 0.0
 
         if len(feature_list) >= 2:
             with torch.no_grad():
-                seq_feats = torch.stack(feature_list, dim=0).unsqueeze(0)   # (1, T, 1280)
-                seq_logits = torch.stack(logit_list, dim=0).unsqueeze(0)    # (1, T, 2)
+                seq_feats = torch.stack(feature_list, dim=0).unsqueeze(
+                    0
+                )  # (1, T, 1280)
+                seq_logits = torch.stack(logit_list, dim=0).unsqueeze(0)  # (1, T, 2)
 
                 # Measure inter-frame feature cosine instability & prediction jitter
                 norm_f = F.normalize(seq_feats.squeeze(0), p=2, dim=-1)
                 cos_sim = torch.sum(norm_f[1:] * norm_f[:-1], dim=-1)
                 feat_drift = float(torch.mean(1.0 - cos_sim).item())
                 score_jitter = float(np.mean(np.abs(np.diff(scores_np))))
-                temporal_flicker_score = min(max((feat_drift * 2.5) + (score_jitter * 1.2), 0.0), 1.0)
+                temporal_flicker_score = min(
+                    max((feat_drift * 2.5) + (score_jitter * 1.2), 0.0), 1.0
+                )
 
                 if self.gru_is_trained and self.gru_model is not None:
                     # Trained Bi-GRU + Temporal Attention prediction (idx 0 = FAKE)
-                    gru_logits, attn_weights = self.gru_model.forward_features(seq_feats, seq_logits)
+                    gru_logits, _ = self.gru_model.forward_features(
+                        seq_feats, seq_logits
+                    )
                     gru_probs = torch.softmax(gru_logits, dim=1)
                     gru_fake_prob = float(gru_probs[0, 0].item())
 
-                    # Combine trained Bi-GRU (60%) + Calibrated 3-Model Spatial Ensemble (40%)
-                    final_fake_conf = 0.60 * gru_fake_prob + 0.40 * spatial_video_score
+                    # Let the 90-95% Spatial Ensemble lead; Bi-GRU acts as temporal refiner
+                    if spatial_video_score < 0.35:
+                        final_fake_conf = (
+                            0.85 * spatial_video_score + 0.15 * gru_fake_prob
+                        )
+                    else:
+                        final_fake_conf = (
+                            0.72 * spatial_video_score + 0.28 * gru_fake_prob
+                        )
                 else:
-                    # Untrained GRU fallback: Use GRU input norm + temporal flicker boost
-                    # If several frames spike as FAKE and there is temporal flicker, boost fake confidence
-                    if top_k_mean > 0.55 and temporal_flicker_score > 0.12:
-                        gru_fake_prob = min(0.99, spatial_video_score + 0.12 * temporal_flicker_score)
-                    elif mean_spatial < 0.30 and top_k_mean < 0.45:
+                    if median_spatial > 0.55 and temporal_flicker_score > 0.15:
+                        gru_fake_prob = min(
+                            0.99, spatial_video_score + 0.10 * temporal_flicker_score
+                        )
+                    elif mean_spatial < 0.30 and median_spatial < 0.35:
                         gru_fake_prob = max(0.01, mean_spatial * 0.90)
                     else:
                         gru_fake_prob = spatial_video_score
@@ -342,7 +404,9 @@ class DeepfakeDetector:
         - Automatically detects if 'input_media' is a video file path (.mp4, .avi, etc.) and runs Bi-GRU video detection.
         - Otherwise runs the exact 90-95% accurate image ensemble detector.
         """
-        if isinstance(input_media, str) and input_media.lower().endswith(VIDEO_EXTENSIONS):
+        if isinstance(input_media, str) and input_media.lower().endswith(
+            VIDEO_EXTENSIONS
+        ):
             return self.predict_video(input_media)
 
         if isinstance(input_media, str):
@@ -352,7 +416,7 @@ class DeepfakeDetector:
         else:
             raw_img = Image.fromarray(cv2.cvtColor(input_media, cv2.COLOR_BGR2RGB))
 
-        batch, _ = self._prepare_face_crops(raw_img)
+        batch, _ = self._prepare_face_crops(raw_img, min_face_prob=0.60)
         fake_conf, _, _ = self._predict_single_batch(batch)
 
         real_conf = 1.0 - fake_conf

@@ -32,12 +32,11 @@ from detector import DeepfakeDetector
 
 # 1. Detector initialize karein (Yeh automatically fine_tuned_v1.pt aur video_gru.pt dono utha lega)
 detector = DeepfakeDetector(
-    model_path="models/fine_tuned.pt",
-    gru_model_path="models/video_gru.pt"
+    model_path="models/fine_tuned.pt", gru_model_path="models/video_gru.pt"
 )
 
 # 2. Apni kisi bhi test video ka path yahan dein
-video_path = "realworld/fake/fake.mp4"
+video_path = "realworld/real/real1.mp4"
 
 
 print(f"🔍 Analyzing video: {video_path} ...")
